@@ -47,8 +47,9 @@ jobs:
       AK3_DIR: ${{ github.workspace }}/AnyKernel3
       SUSFS_DIR: ${{ github.workspace }}/susfs4ksu
 
-      # Pin ReSukiSU so builds are reproducible.
+      # Pinned for reproducible builds
       RESUKISU_COMMIT: 94dd3c93c2053a84fd752df6eb85db99b7d70ab8
+      SUSFS_COMMIT: 24743360ea08d98f6ad72b856851abed8de5854f
 
     steps:
       - name: Show runner resources
@@ -56,8 +57,13 @@ jobs:
         run: |
           set -euxo pipefail
 
+          echo "=== CPU ==="
           nproc
+
+          echo "=== RAM ==="
           free -h
+
+          echo "=== DISK ==="
           df -h /
 
       - name: Free disk space
@@ -70,6 +76,7 @@ jobs:
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/boost
 
+          echo "=== DISK AFTER CLEANUP ==="
           df -h /
 
       - name: Install required packages
@@ -125,6 +132,7 @@ jobs:
             --no-clone-bundle \
             -j4
 
+          echo "=== DISK AFTER SYNC ==="
           df -h /
 
       - name: Switch common source to Zephyr
@@ -152,8 +160,18 @@ jobs:
           echo "SOURCE_SHA=$SOURCE_SHA" >> "$GITHUB_ENV"
           echo "SOURCE_SUBJECT=$SOURCE_SUBJECT" >> "$GITHUB_ENV"
 
-          echo "Source SHA: $SOURCE_SHA"
-          echo "Source subject: $SOURCE_SUBJECT"
+          echo "=== SOURCE ==="
+          echo "Branch  : $SOURCE_BRANCH"
+          echo "Commit  : $SOURCE_SHA"
+          echo "Subject : $SOURCE_SUBJECT"
+
+          {
+            echo "## Zephyr Kernel Build"
+            echo ""
+            echo "- Source: \`$SOURCE_BRANCH\`"
+            echo "- Commit: \`$SOURCE_SHA\`"
+            echo "- LTO: \`$LTO_MODE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Detect kernel version
         shell: bash
@@ -181,6 +199,7 @@ jobs:
 
           test -x tools/bazel
           test -f common/arch/arm64/configs/gki_defconfig
+          test -f common/build.config.constants
 
           CLANG_VERSION="$(
             sed -n 's/^CLANG_VERSION=//p' \
@@ -193,6 +212,7 @@ jobs:
 
           echo "CLANG_VERSION=$CLANG_VERSION" >> "$GITHUB_ENV"
 
+          echo "=== CLANG ==="
           "$CLANG_BIN" --version
 
       - name: Integrate ReSukiSU
@@ -219,7 +239,8 @@ jobs:
 
           echo "KSU_SHA=$KSU_SHA" >> "$GITHUB_ENV"
 
-          echo "ReSukiSU commit: $KSU_SHA"
+          echo "=== RESUKISU ==="
+          echo "Commit: $KSU_SHA"
 
       - name: Fetch SUSFS
         shell: bash
@@ -228,11 +249,19 @@ jobs:
 
           rm -rf "$SUSFS_DIR"
 
-          git clone \
+          git init "$SUSFS_DIR"
+
+          git -C "$SUSFS_DIR" remote add origin \
+            https://gitlab.com/simonpunk/susfs4ksu.git
+
+          git -C "$SUSFS_DIR" fetch \
             --depth=1 \
-            --branch gki-android14-6.1 \
-            https://gitlab.com/simonpunk/susfs4ksu.git \
-            "$SUSFS_DIR"
+            origin \
+            "$SUSFS_COMMIT"
+
+          git -C "$SUSFS_DIR" checkout \
+            --detach \
+            FETCH_HEAD
 
           SUSFS_SHA="$(
             git -C "$SUSFS_DIR" rev-parse HEAD
@@ -240,7 +269,10 @@ jobs:
 
           echo "SUSFS_SHA=$SUSFS_SHA" >> "$GITHUB_ENV"
 
-          echo "SUSFS commit: $SUSFS_SHA"
+          echo "=== SUSFS ==="
+          echo "Commit: $SUSFS_SHA"
+
+          test "$SUSFS_SHA" = "$SUSFS_COMMIT"
 
       - name: Apply SUSFS kernel patch
         shell: bash
@@ -248,8 +280,12 @@ jobs:
           set -euxo pipefail
 
           PATCH_FILE="$SUSFS_DIR/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch"
+          NAMESPACE_FILE="$WORKSPACE_DIR/common/fs/namespace.c"
 
           test -f "$PATCH_FILE"
+          test -f "$NAMESPACE_FILE"
+
+          echo "=== COPY SUSFS SOURCE ==="
 
           cp "$SUSFS_DIR"/kernel_patches/fs/* \
             "$WORKSPACE_DIR/common/fs/"
@@ -259,7 +295,31 @@ jobs:
 
           cd "$WORKSPACE_DIR/common"
 
-          echo "=== SUSFS dry-run ==="
+          #
+          # Luminaire 6.1.187 adds:
+          #
+          #   #include <trace/hooks/blk.h>
+          #
+          # directly after internal.h.
+          #
+          # The upstream SUSFS patch expects the original Android common
+          # context here. Temporarily remove ONLY this Luminaire-specific
+          # include, apply SUSFS strictly with fuzz=0, then restore it.
+          #
+
+          TRACE_HOOK_PRESENT=0
+
+          if grep -Fxq '#include <trace/hooks/blk.h>' fs/namespace.c; then
+            TRACE_HOOK_PRESENT=1
+
+            echo "Luminaire blk trace hook detected."
+
+            sed -i \
+              '\|#include <trace/hooks/blk.h>|d' \
+              fs/namespace.c
+          fi
+
+          echo "=== SUSFS STRICT DRY RUN ==="
 
           patch \
             --dry-run \
@@ -268,7 +328,7 @@ jobs:
             --no-backup-if-mismatch \
             < "$PATCH_FILE"
 
-          echo "=== Applying SUSFS ==="
+          echo "=== APPLY SUSFS ==="
 
           patch \
             -p1 \
@@ -276,11 +336,59 @@ jobs:
             --no-backup-if-mismatch \
             < "$PATCH_FILE"
 
+          echo "=== RESTORE LUMINAIRE TRACE HOOK ==="
+
+          if [ "$TRACE_HOOK_PRESENT" = "1" ]; then
+            sed -i \
+              '/#include "internal.h"/a #include <trace/hooks/blk.h>' \
+              fs/namespace.c
+          fi
+
+          echo "=== VERIFY TRACE HOOK ==="
+
+          if [ "$TRACE_HOOK_PRESENT" = "1" ]; then
+            grep -Fx \
+              '#include <trace/hooks/blk.h>' \
+              fs/namespace.c
+          fi
+
+          echo "=== VERIFY SUSFS NAMESPACE ==="
+
+          grep -F \
+            '#include <linux/susfs_def.h>' \
+            fs/namespace.c
+
+          grep -F \
+            'susfs_ksu_mnt_group_ida' \
+            fs/namespace.c
+
+          grep -F \
+            'susfs_ksu_mounts' \
+            fs/namespace.c
+
+          echo "=== CHECK REJECTED HUNKS ==="
+
           if find . -name '*.rej' | grep -q .; then
+
             echo "SUSFS generated rejected hunks:"
+
             find . -name '*.rej' -print
+
+            while IFS= read -r rej; do
+
+              echo "================================="
+              echo "$rej"
+              echo "================================="
+
+              cat "$rej"
+
+            done < <(find . -name '*.rej')
+
             exit 1
           fi
+
+          echo "=== SUSFS PATCH APPLIED SUCCESSFULLY ==="
+          echo "Fuzz level: 0"
 
       - name: Configure Zephyr and ReSukiSU
         shell: bash
@@ -310,16 +418,25 @@ jobs:
           CONFIG_TMPFS_POSIX_ACL=y
           EOF
 
-          echo "=== Zephyr config fragment ==="
+          echo "=== ZEPHYR CONFIG FRAGMENT ==="
+
           cat "$FRAGMENT"
 
-          # Custom GKI config differs intentionally from Google's canonical
-          # gki_defconfig, so do not enforce the vanilla defconfig comparison.
+          #
+          # GKI defconfig is intentionally extended.
+          #
+          # check_defconfig expects Google's unmodified canonical config
+          # and would reject our ReSukiSU/SUSFS fragment.
+          #
+
           sed -i \
             's/POST_DEFCONFIG_CMDS="check_defconfig"/POST_DEFCONFIG_CMDS=""/' \
             "$WORKSPACE_DIR/common/build.config.gki"
 
-          # Cosmetic build identity.
+          #
+          # Cosmetic build identity
+          #
+
           cat >> "$WORKSPACE_DIR/common/build.config.common" <<'EOF'
 
           KBUILD_BUILD_USER=afarhandanu
@@ -332,25 +449,32 @@ jobs:
           set -euxo pipefail
 
           case "$LTO_MODE" in
+
             none)
               LTO_NAME="NoLTO"
               ;;
+
             thin)
               LTO_NAME="ThinLTO"
               ;;
+
             full)
               LTO_NAME="FullLTO"
               ;;
+
             *)
               echo "Unknown LTO mode: $LTO_MODE"
               exit 1
               ;;
+
           esac
 
           ZIP_NAME="ZephyrKernel-${KERNEL_VERSION}-RESUKISU+SUSFS-${LTO_NAME}.zip"
 
           echo "LTO_NAME=$LTO_NAME" >> "$GITHUB_ENV"
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+          echo "ZIP: $ZIP_NAME"
 
       - name: Build ARM64 GKI
         shell: bash
@@ -360,6 +484,7 @@ jobs:
           cd "$WORKSPACE_DIR"
 
           rm -rf "$DIST_DIR"
+
           mkdir -p "$DIST_DIR"
 
           tools/bazel run \
@@ -369,11 +494,13 @@ jobs:
             -- \
             --destdir="$DIST_DIR"
 
+          echo "=== BUILD COMPLETE ==="
+
           test -s "$DIST_DIR/Image"
 
           ls -lh "$DIST_DIR/Image"
 
-      - name: Extract and verify kernel config
+      - name: Extract embedded kernel config
         shell: bash
         run: |
           set -euxo pipefail
@@ -385,20 +512,37 @@ jobs:
           from pathlib import Path
 
           image = Path("dist/Image")
+
           data = image.read_bytes()
 
           start = data.find(b"IKCFG_ST")
           end = data.find(b"IKCFG_ED", start + 8)
 
           if start < 0 or end < 0:
-              raise SystemExit("Embedded kernel config not found")
+              raise SystemExit(
+                  "Embedded kernel config not found"
+              )
 
           config = gzip.decompress(
               data[start + 8:end]
-          ).decode("utf-8", "replace")
+          ).decode(
+              "utf-8",
+              "replace"
+          )
 
-          Path("release/kernel.config").write_text(config)
+          Path(
+              "release/kernel.config"
+          ).write_text(
+              config
+          )
           PY
+
+          test -s "$RELEASE_DIR/kernel.config"
+
+      - name: Verify kernel configuration
+        shell: bash
+        run: |
+          set -euxo pipefail
 
           CONFIG="$RELEASE_DIR/kernel.config"
 
@@ -418,78 +562,111 @@ jobs:
             'CONFIG_CFI_CLANG=y'
           )
 
+          echo "=== VERIFY REQUIRED CONFIG ==="
+
           for OPTION in "${REQUIRED[@]}"; do
-            grep -Fx "$OPTION" "$CONFIG" || {
-              echo "Missing required config: $OPTION"
+
+            if ! grep -Fx "$OPTION" "$CONFIG"; then
+
+              echo "Missing required config:"
+              echo "$OPTION"
+
               exit 1
-            }
+
+            fi
+
           done
 
+          echo "=== VERIFY LTO ==="
+
           case "$LTO_MODE" in
+
             none)
-              grep -Fx 'CONFIG_LTO_NONE=y' "$CONFIG"
+              grep -Fx \
+                'CONFIG_LTO_NONE=y' \
+                "$CONFIG"
               ;;
+
             thin)
-              grep -Fx 'CONFIG_LTO_CLANG_THIN=y' "$CONFIG"
+              grep -Fx \
+                'CONFIG_LTO_CLANG_THIN=y' \
+                "$CONFIG"
               ;;
+
             full)
-              grep -Fx 'CONFIG_LTO_CLANG_FULL=y' "$CONFIG"
+              grep -Fx \
+                'CONFIG_LTO_CLANG_FULL=y' \
+                "$CONFIG"
               ;;
+
           esac
 
-          echo "=== KSU / SUSFS CONFIG ==="
+          echo "=== KSU CONFIG ==="
 
-          grep '^CONFIG_KSU' "$CONFIG" || true
+          grep '^CONFIG_KSU' \
+            "$CONFIG" \
+            || true
 
           echo "=== LTO CONFIG ==="
 
-          grep '^CONFIG_LTO' "$CONFIG" || true
+          grep '^CONFIG_LTO' \
+            "$CONFIG" \
+            || true
 
           echo "=== LOCALVERSION ==="
 
-          grep '^CONFIG_LOCALVERSION' "$CONFIG" || true
+          grep '^CONFIG_LOCALVERSION' \
+            "$CONFIG" \
+            || true
 
-      - name: Verify ReSukiSU and SUSFS in Image
+      - name: Verify ReSukiSU SUSFS and branding
         shell: bash
         run: |
           set -euxo pipefail
 
-          echo "=== IMAGE ==="
+          echo "=== IMAGE INFORMATION ==="
 
           file "$DIST_DIR/Image"
+
           ls -lh "$DIST_DIR/Image"
+
           sha256sum "$DIST_DIR/Image"
 
-          echo "=== KERNEL VERSION STRING ==="
+          echo "=== KERNEL VERSION ==="
+
+          KERNEL_STRING="$(
+            strings "$DIST_DIR/Image" \
+              | grep -m1 '^Linux version ' \
+              || true
+          )"
+
+          echo "$KERNEL_STRING"
+
+          if ! echo "$KERNEL_STRING" | grep -q 'Zephyr'; then
+
+            echo "Zephyr branding not found."
+
+            exit 1
+
+          fi
+
+          echo "=== RESUKISU SIGNATURE ==="
 
           strings "$DIST_DIR/Image" \
-            | grep -m1 '^Linux version ' \
-            || true
-
-          echo "=== ReSukiSU ==="
-
-          strings "$DIST_DIR/Image" \
-            | grep -m1 'KernelSU: Initialized with driver version' \
+            | grep -m1 \
+              'KernelSU: Initialized with driver version' \
             || {
-              echo "ReSukiSU/KernelSU signature not found"
+              echo "ReSukiSU signature not found."
               exit 1
             }
 
-          echo "=== SUSFS ==="
+          echo "=== SUSFS SIGNATURE ==="
 
           strings "$DIST_DIR/Image" \
-            | grep -m1 'susfs is initialized! version' \
+            | grep -m1 \
+              'susfs is initialized! version' \
             || {
-              echo "SUSFS signature not found"
-              exit 1
-            }
-
-          echo "=== Zephyr branding ==="
-
-          strings "$DIST_DIR/Image" \
-            | grep -m1 'Linux version .*Zephyr' \
-            || {
-              echo "Zephyr branding not found"
+              echo "SUSFS signature not found."
               exit 1
             }
 
@@ -536,6 +713,8 @@ jobs:
           ### AnyKernel3 Ramdisk Mod Script
           ## osm0sis @ xda-developers
 
+          ### Zephyr Kernel
+
           properties() { '
           kernel.string=Zephyr Kernel | ReSukiSU + SUSFS
           do.devicecheck=0
@@ -571,27 +750,43 @@ jobs:
           ui_print "  Android 14 GKI 6.1"
           ui_print " "
 
-          kernel_version=$(cat /proc/version | awk -F '-' '{print $1}' | awk '{print $3}')
+          kernel_version=$(
+            cat /proc/version \
+              | awk -F '-' '{print $1}' \
+              | awk '{print $3}'
+          )
 
           case "$kernel_version" in
+
             6.1*)
-              ui_print "  Current kernel: $kernel_version"
+              ui_print "  Current Kernel: $kernel_version"
               ;;
+
             *)
-              abort "  Unsupported kernel: $kernel_version"
+              abort "  Unsupported Kernel: $kernel_version"
               ;;
+
           esac
 
           ui_print " "
-          ui_print "  Patching boot image..."
+          ui_print "  Splitting boot image..."
 
           split_boot
 
           if [ -f "$SPLITIMG/ramdisk.cpio" ]; then
+
+            ui_print "  Ramdisk detected."
+
             unpack_ramdisk
+
             write_boot
+
           else
+
+            ui_print "  No ramdisk detected."
+
             flash_boot
+
           fi
 
           ui_print " "
@@ -625,20 +820,20 @@ jobs:
 
           {
             echo "ZephyrKernel"
-            echo
+            echo ""
             echo "kernel_version=$KERNEL_VERSION"
             echo "root=ReSukiSU"
             echo "susfs=enabled"
             echo "lto=$LTO_MODE"
             echo "clang=$CLANG_VERSION"
-            echo
+            echo ""
             echo "source_branch=$SOURCE_BRANCH"
             echo "source_sha=$SOURCE_SHA"
             echo "source_subject=$SOURCE_SUBJECT"
-            echo
+            echo ""
             echo "resukisu_sha=$KSU_SHA"
             echo "susfs_sha=$SUSFS_SHA"
-            echo
+            echo ""
             echo "github_run=$GITHUB_RUN_NUMBER"
           } > "$RELEASE_DIR/build-info.txt"
 
@@ -655,9 +850,15 @@ jobs:
 
           cd "$RELEASE_DIR"
 
+          echo "=== ZIP TEST ==="
+
           unzip -t "$ZIP_NAME"
 
+          echo "=== ZIP CONTENTS ==="
+
           unzip -l "$ZIP_NAME"
+
+          echo "=== EXTRACT IMAGE ==="
 
           unzip -p \
             "$ZIP_NAME" \
@@ -666,33 +867,41 @@ jobs:
 
           test -s /tmp/Zephyr-Image
 
+          echo "=== RAW IMAGE ==="
+
+          ls -lh /tmp/Zephyr-Image
+
           file /tmp/Zephyr-Image
 
-          echo "=== RAW IMAGE ==="
-          ls -lh /tmp/Zephyr-Image
           sha256sum /tmp/Zephyr-Image
 
           echo "=== FLASHABLE ZIP ==="
+
           ls -lh "$ZIP_NAME"
+
           sha256sum "$ZIP_NAME"
 
           {
-            echo "## Zephyr Kernel"
-            echo
+            echo ""
+            echo "## Zephyr Kernel Package"
+            echo ""
             echo "- Kernel: \`$KERNEL_VERSION\`"
+            echo "- Branding: \`Zephyr\`"
             echo "- Root: \`ReSukiSU\`"
             echo "- SUSFS: \`enabled\`"
             echo "- LTO: \`$LTO_NAME\`"
             echo "- Source: \`$SOURCE_SHA\`"
             echo "- ReSukiSU: \`$KSU_SHA\`"
             echo "- SUSFS: \`$SUSFS_SHA\`"
-            echo "- File: \`$ZIP_NAME\`"
+            echo "- ZIP: \`$ZIP_NAME\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show disk usage
         if: always()
         shell: bash
         run: |
+          echo "=== FINAL DISK USAGE ==="
+
           df -h /
 
       - name: Upload flashable kernel
