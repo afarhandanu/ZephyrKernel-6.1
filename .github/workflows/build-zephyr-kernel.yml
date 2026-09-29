@@ -42,36 +42,72 @@ jobs:
       LTO_MODE: ${{ inputs.lto }}
       WORKSPACE_DIR: ${{ github.workspace }}/kernel-workspace
       DIST_DIR: ${{ github.workspace }}/dist
+      RELEASE_DIR: ${{ github.workspace }}/release
+      AK3_DIR: ${{ github.workspace }}/AnyKernel3
 
     steps:
       - name: Show runner resources
+        shell: bash
         run: |
           set -euxo pipefail
+
+          echo "=== CPU ==="
           nproc
+
+          echo "=== RAM ==="
           free -h
+
+          echo "=== DISK ==="
           df -h /
 
       - name: Free disk space
+        shell: bash
         run: |
           set -euxo pipefail
+
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf /usr/local/share/boost
+
+          echo "=== DISK AFTER CLEANUP ==="
           df -h /
 
-      - name: Install repo tool
+      - name: Install required packages
+        shell: bash
         run: |
           set -euxo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y \
+            curl \
+            git \
+            zip \
+            unzip \
+            file
+
+      - name: Install repo tool
+        shell: bash
+        run: |
+          set -euxo pipefail
+
           mkdir -p "$HOME/bin"
-          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
+
+          curl -fsSL \
+            https://storage.googleapis.com/git-repo-downloads/repo \
             -o "$HOME/bin/repo"
+
           chmod +x "$HOME/bin/repo"
+
           echo "$HOME/bin" >> "$GITHUB_PATH"
 
+          "$HOME/bin/repo" version
+
       - name: Initialize Android kernel workspace
+        shell: bash
         run: |
           set -euxo pipefail
+
           mkdir -p "$WORKSPACE_DIR"
           cd "$WORKSPACE_DIR"
 
@@ -86,16 +122,26 @@ jobs:
             --no-clone-bundle \
             -j4
 
+          echo "=== DISK AFTER REPO SYNC ==="
+          df -h /
+
       - name: Switch common source to Zephyr
+        shell: bash
         run: |
           set -euxo pipefail
+
           cd "$WORKSPACE_DIR/common"
 
           git remote remove zephyr 2>/dev/null || true
+
           git remote add zephyr \
             "https://github.com/${GITHUB_REPOSITORY}.git"
 
-          git fetch --depth=1 zephyr "$SOURCE_BRANCH"
+          git fetch \
+            --depth=1 \
+            zephyr \
+            "$SOURCE_BRANCH"
+
           git checkout --detach FETCH_HEAD
 
           SOURCE_SHA="$(git rev-parse HEAD)"
@@ -104,8 +150,14 @@ jobs:
           echo "SOURCE_SHA=$SOURCE_SHA" >> "$GITHUB_ENV"
           echo "SOURCE_SUBJECT=$SOURCE_SUBJECT" >> "$GITHUB_ENV"
 
+          echo "=== SOURCE ==="
+          echo "Branch  : $SOURCE_BRANCH"
+          echo "Commit  : $SOURCE_SHA"
+          echo "Subject : $SOURCE_SUBJECT"
+          echo "LTO     : $LTO_MODE"
+
           {
-            echo "### Zephyr source"
+            echo "## Zephyr Kernel Build"
             echo ""
             echo "- Branch: \`$SOURCE_BRANCH\`"
             echo "- Commit: \`$SOURCE_SHA\`"
@@ -113,13 +165,41 @@ jobs:
             echo "- LTO: \`$LTO_MODE\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Verify toolchain
+      - name: Detect kernel version
+        shell: bash
         run: |
           set -euxo pipefail
+
+          cd "$WORKSPACE_DIR/common"
+
+          VERSION="$(
+            sed -n 's/^VERSION = //p' Makefile
+          )"
+
+          PATCHLEVEL="$(
+            sed -n 's/^PATCHLEVEL = //p' Makefile
+          )"
+
+          SUBLEVEL="$(
+            sed -n 's/^SUBLEVEL = //p' Makefile
+          )"
+
+          KERNEL_VERSION="${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
+
+          echo "KERNEL_VERSION=$KERNEL_VERSION" >> "$GITHUB_ENV"
+
+          echo "Kernel version: $KERNEL_VERSION"
+
+      - name: Verify toolchain
+        shell: bash
+        run: |
+          set -euxo pipefail
+
           cd "$WORKSPACE_DIR"
 
           test -x tools/bazel
           test -f common/arch/arm64/configs/gki_defconfig
+          test -f common/build.config.constants
 
           CLANG_VERSION="$(
             sed -n 's/^CLANG_VERSION=//p' \
@@ -131,11 +211,15 @@ jobs:
           test -x "$CLANG_BIN"
 
           echo "CLANG_VERSION=$CLANG_VERSION" >> "$GITHUB_ENV"
+
+          echo "=== CLANG ==="
           "$CLANG_BIN" --version
 
       - name: Build ARM64 GKI
+        shell: bash
         run: |
           set -euxo pipefail
+
           cd "$WORKSPACE_DIR"
 
           rm -rf "$DIST_DIR"
@@ -147,30 +231,282 @@ jobs:
             -- \
             --destdir="$DIST_DIR"
 
-      - name: Add build information
-        if: success()
+          echo "=== BUILD COMPLETED ==="
+
+          test -f "$DIST_DIR/Image"
+
+          ls -lh "$DIST_DIR/Image"
+
+      - name: Verify kernel Image
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          test -s "$DIST_DIR/Image"
+
+          echo "=== IMAGE INFORMATION ==="
+
+          ls -lh "$DIST_DIR/Image"
+
+          file "$DIST_DIR/Image"
+
+          sha256sum "$DIST_DIR/Image"
+
+      - name: Prepare release name
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          case "$LTO_MODE" in
+            none)
+              LTO_NAME="NoLTO"
+              ;;
+            thin)
+              LTO_NAME="ThinLTO"
+              ;;
+            full)
+              LTO_NAME="FullLTO"
+              ;;
+            *)
+              echo "Unknown LTO mode: $LTO_MODE"
+              exit 1
+              ;;
+          esac
+
+          ZIP_NAME="ZephyrKernel-${KERNEL_VERSION}-VANILLA-${LTO_NAME}.zip"
+
+          echo "LTO_NAME=$LTO_NAME" >> "$GITHUB_ENV"
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+          echo "Release name: $ZIP_NAME"
+
+      - name: Prepare AnyKernel3
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf "$AK3_DIR"
+          rm -rf "$RELEASE_DIR"
+
+          mkdir -p "$RELEASE_DIR"
+
+          git clone \
+            https://github.com/osm0sis/AnyKernel3.git \
+            "$AK3_DIR"
+
+          cd "$AK3_DIR"
+
+          # Pin AnyKernel3 to a known revision
+          git checkout \
+            020dfeccf9d7e962a48400fc94d3e451df92eead
+
+          # Remove repository/development files
+          rm -rf .git
+          rm -rf .github
+          rm -rf modules
+          rm -rf patch
+          rm -rf ramdisk
+
+          rm -f README.md
+          rm -f LICENSE
+
+          # Copy raw ARM64 kernel Image
+          cp "$DIST_DIR/Image" "$AK3_DIR/Image"
+
+          test -s "$AK3_DIR/Image"
+
+      - name: Configure AnyKernel3
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$AK3_DIR"
+
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          ### Zephyr Kernel
+
+          properties() { '
+          kernel.string=Zephyr Kernel
+          do.devicecheck=0
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          do.check_boot_version=0
+          device.name1=
+          device.name2=
+          device.name3=
+          device.name4=
+          device.name5=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+
+          ### AnyKernel install
+
+          block=boot
+          is_slot_device=auto
+          ramdisk_compression=auto
+          patch_vbmeta_flag=auto
+          no_magisk_check=1
+
+          . tools/ak3-core.sh
+
+          ui_print " "
+          ui_print "================================="
+          ui_print "          ZEPHYR KERNEL"
+          ui_print "================================="
+          ui_print " "
+          ui_print "  GKI: Android 14 / Kernel 6.1"
+          ui_print "  Variant: VANILLA"
+          ui_print " "
+
+          kernel_version=$(cat /proc/version | awk -F '-' '{print $1}' | awk '{print $3}')
+
+          case "$kernel_version" in
+            6.1*)
+              ui_print "  Current Kernel: $kernel_version"
+              ;;
+            *)
+              abort "  Unsupported kernel: $kernel_version"
+              ;;
+          esac
+
+          ui_print " "
+          ui_print "  Splitting boot image..."
+
+          split_boot
+
+          if [ -f "$SPLITIMG/ramdisk.cpio" ]; then
+            ui_print "  Ramdisk detected."
+            unpack_ramdisk
+            write_boot
+          else
+            ui_print "  No ramdisk detected."
+            flash_boot
+          fi
+
+          ui_print " "
+          ui_print "================================="
+          ui_print "    Zephyr Kernel Installed"
+          ui_print "================================="
+          ui_print " "
+          EOF
+
+          chmod 755 anykernel.sh
+
+      - name: Build flashable ZIP
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$AK3_DIR"
+
+          zip -r9 \
+            "$RELEASE_DIR/$ZIP_NAME" \
+            . \
+            -x "*.git*" \
+            -x "*.DS_Store"
+
+          test -s "$RELEASE_DIR/$ZIP_NAME"
+
+      - name: Create build information
+        shell: bash
         run: |
           set -euxo pipefail
 
           {
-            echo "ZephyrKernel-6.1"
+            echo "ZephyrKernel"
+            echo ""
+            echo "kernel_version=$KERNEL_VERSION"
+            echo "variant=VANILLA"
+            echo "lto=$LTO_MODE"
+            echo "clang=$CLANG_VERSION"
             echo "source_branch=$SOURCE_BRANCH"
             echo "source_sha=$SOURCE_SHA"
             echo "source_subject=$SOURCE_SUBJECT"
-            echo "lto=$LTO_MODE"
-            echo "clang=$CLANG_VERSION"
-            echo "github_run=${GITHUB_RUN_NUMBER}"
-          } > "$DIST_DIR/build-info.txt"
+            echo "github_run=$GITHUB_RUN_NUMBER"
+          } > "$RELEASE_DIR/build-info.txt"
 
-          cd "$DIST_DIR"
-          sha256sum * > SHA256SUMS.txt
+          cd "$RELEASE_DIR"
 
-      - name: Upload artifacts
+          sha256sum \
+            "$ZIP_NAME" \
+            > SHA256SUMS.txt
+
+      - name: Verify flashable ZIP
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          cd "$RELEASE_DIR"
+
+          echo "=== ZIP TEST ==="
+
+          unzip -t "$ZIP_NAME"
+
+          echo "=== ZIP CONTENTS ==="
+
+          unzip -l "$ZIP_NAME"
+
+          echo "=== EXTRACT KERNEL FOR VERIFICATION ==="
+
+          unzip -p \
+            "$ZIP_NAME" \
+            Image \
+            > /tmp/Zephyr-Image
+
+          test -s /tmp/Zephyr-Image
+
+          echo "=== RAW IMAGE ==="
+
+          ls -lh /tmp/Zephyr-Image
+
+          file /tmp/Zephyr-Image
+
+          sha256sum /tmp/Zephyr-Image
+
+          echo "=== FLASHABLE ZIP ==="
+
+          ls -lh "$ZIP_NAME"
+
+          sha256sum "$ZIP_NAME"
+
+          {
+            echo ""
+            echo "## Flashable Package"
+            echo ""
+            echo "- Kernel: \`$KERNEL_VERSION\`"
+            echo "- Variant: \`VANILLA\`"
+            echo "- LTO: \`$LTO_NAME\`"
+            echo "- File: \`$ZIP_NAME\`"
+            echo "- Source: \`$SOURCE_SHA\`"
+            echo ""
+            echo '```text'
+            ls -lh "$ZIP_NAME"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show disk usage
+        if: always()
+        shell: bash
+        run: |
+          echo "=== FINAL DISK USAGE ==="
+          df -h /
+
+      - name: Upload flashable kernel
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ZephyrKernel-6.1-${{ inputs.source_branch }}-${{ inputs.lto }}-run${{ github.run_number }}
-          path: dist/
+          name: ZephyrKernel-${{ inputs.lto }}-run${{ github.run_number }}
+          path: |
+            release/*.zip
+            release/build-info.txt
+            release/SHA256SUMS.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
