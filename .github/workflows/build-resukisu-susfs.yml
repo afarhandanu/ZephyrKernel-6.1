@@ -47,7 +47,7 @@ jobs:
       AK3_DIR: ${{ github.workspace }}/AnyKernel3
       SUSFS_DIR: ${{ github.workspace }}/susfs4ksu
 
-      # Pinned for reproducible builds
+      # Pin revisions for reproducible builds.
       RESUKISU_COMMIT: 94dd3c93c2053a84fd752df6eb85db99b7d70ab8
       SUSFS_COMMIT: 24743360ea08d98f6ad72b856851abed8de5854f
 
@@ -293,23 +293,24 @@ jobs:
           cp "$SUSFS_DIR"/kernel_patches/include/linux/* \
             "$WORKSPACE_DIR/common/include/linux/"
 
+          test -s "$WORKSPACE_DIR/common/fs/susfs.c"
+          test -s "$WORKSPACE_DIR/common/include/linux/susfs.h"
+          test -s "$WORKSPACE_DIR/common/include/linux/susfs_def.h"
+
           cd "$WORKSPACE_DIR/common"
 
           #
-          # Luminaire 6.1.187 adds:
+          # Luminaire has one Android-specific trace hook exactly
+          # where the SUSFS namespace patch expects upstream context.
           #
-          #   #include <trace/hooks/blk.h>
-          #
-          # directly after internal.h.
-          #
-          # The upstream SUSFS patch expects the original Android common
-          # context here. Temporarily remove ONLY this Luminaire-specific
-          # include, apply SUSFS strictly with fuzz=0, then restore it.
+          # Remove ONLY this line temporarily, apply SUSFS strictly
+          # with fuzz=0, then restore it.
           #
 
           TRACE_HOOK_PRESENT=0
 
           if grep -Fxq '#include <trace/hooks/blk.h>' fs/namespace.c; then
+
             TRACE_HOOK_PRESENT=1
 
             echo "Luminaire blk trace hook detected."
@@ -317,6 +318,7 @@ jobs:
             sed -i \
               '\|#include <trace/hooks/blk.h>|d' \
               fs/namespace.c
+
           fi
 
           echo "=== SUSFS STRICT DRY RUN ==="
@@ -339,32 +341,46 @@ jobs:
           echo "=== RESTORE LUMINAIRE TRACE HOOK ==="
 
           if [ "$TRACE_HOOK_PRESENT" = "1" ]; then
+
             sed -i \
               '/#include "internal.h"/a #include <trace/hooks/blk.h>' \
               fs/namespace.c
+
           fi
 
-          echo "=== VERIFY TRACE HOOK ==="
+          echo "=== VERIFY LUMINAIRE TRACE HOOK ==="
 
           if [ "$TRACE_HOOK_PRESENT" = "1" ]; then
+
             grep -Fx \
               '#include <trace/hooks/blk.h>' \
               fs/namespace.c
+
           fi
 
-          echo "=== VERIFY SUSFS NAMESPACE ==="
+          echo "=== VERIFY SUSFS SOURCE ==="
+
+          test -s fs/susfs.c
+          test -s include/linux/susfs.h
+          test -s include/linux/susfs_def.h
 
           grep -F \
             '#include <linux/susfs_def.h>' \
             fs/namespace.c
 
           grep -F \
-            'susfs_ksu_mnt_group_ida' \
-            fs/namespace.c
+            'CONFIG_KSU_SUSFS' \
+            fs/Makefile
 
-          grep -F \
-            'susfs_ksu_mounts' \
-            fs/namespace.c
+          #
+          # Do not verify internal SUSFS variable names here.
+          # Internal names can change between SUSFS revisions.
+          #
+          # The actual features will be verified later against:
+          #
+          #   1. final embedded kernel .config
+          #   2. final compiled Image strings
+          #
 
           echo "=== CHECK REJECTED HUNKS ==="
 
@@ -385,6 +401,7 @@ jobs:
             done < <(find . -name '*.rej')
 
             exit 1
+
           fi
 
           echo "=== SUSFS PATCH APPLIED SUCCESSFULLY ==="
@@ -423,10 +440,8 @@ jobs:
           cat "$FRAGMENT"
 
           #
-          # GKI defconfig is intentionally extended.
-          #
-          # check_defconfig expects Google's unmodified canonical config
-          # and would reject our ReSukiSU/SUSFS fragment.
+          # This is intentionally no longer Google's untouched
+          # canonical GKI defconfig.
           #
 
           sed -i \
@@ -516,15 +531,28 @@ jobs:
           data = image.read_bytes()
 
           start = data.find(b"IKCFG_ST")
-          end = data.find(b"IKCFG_ED", start + 8)
 
-          if start < 0 or end < 0:
+          if start < 0:
               raise SystemExit(
-                  "Embedded kernel config not found"
+                  "IKCFG_ST not found in kernel Image"
               )
 
+          end = data.find(
+              b"IKCFG_ED",
+              start + len(b"IKCFG_ST")
+          )
+
+          if end < 0:
+              raise SystemExit(
+                  "IKCFG_ED not found in kernel Image"
+              )
+
+          compressed = data[
+              start + len(b"IKCFG_ST"):end
+          ]
+
           config = gzip.decompress(
-              data[start + 8:end]
+              compressed
           ).decode(
               "utf-8",
               "replace"
@@ -582,21 +610,27 @@ jobs:
           case "$LTO_MODE" in
 
             none)
+
               grep -Fx \
                 'CONFIG_LTO_NONE=y' \
                 "$CONFIG"
+
               ;;
 
             thin)
+
               grep -Fx \
                 'CONFIG_LTO_CLANG_THIN=y' \
                 "$CONFIG"
+
               ;;
 
             full)
+
               grep -Fx \
                 'CONFIG_LTO_CLANG_FULL=y' \
                 "$CONFIG"
+
               ;;
 
           esac
@@ -650,25 +684,29 @@ jobs:
 
           fi
 
-          echo "=== RESUKISU SIGNATURE ==="
+          echo "=== RESUKISU / KERNELSU SIGNATURE ==="
 
-          strings "$DIST_DIR/Image" \
+          if ! strings "$DIST_DIR/Image" \
             | grep -m1 \
-              'KernelSU: Initialized with driver version' \
-            || {
-              echo "ReSukiSU signature not found."
-              exit 1
-            }
+              'KernelSU: Initialized with driver version'; then
+
+            echo "ReSukiSU/KernelSU signature not found."
+
+            exit 1
+
+          fi
 
           echo "=== SUSFS SIGNATURE ==="
 
-          strings "$DIST_DIR/Image" \
+          if ! strings "$DIST_DIR/Image" \
             | grep -m1 \
-              'susfs is initialized! version' \
-            || {
-              echo "SUSFS signature not found."
-              exit 1
-            }
+              'susfs is initialized! version'; then
+
+            echo "SUSFS signature not found."
+
+            exit 1
+
+          fi
 
       - name: Prepare AnyKernel3
         shell: bash
@@ -759,11 +797,15 @@ jobs:
           case "$kernel_version" in
 
             6.1*)
+
               ui_print "  Current Kernel: $kernel_version"
+
               ;;
 
             *)
+
               abort "  Unsupported Kernel: $kernel_version"
+
               ;;
 
           esac
@@ -822,6 +864,7 @@ jobs:
             echo "ZephyrKernel"
             echo ""
             echo "kernel_version=$KERNEL_VERSION"
+            echo "branding=Zephyr"
             echo "root=ReSukiSU"
             echo "susfs=enabled"
             echo "lto=$LTO_MODE"
