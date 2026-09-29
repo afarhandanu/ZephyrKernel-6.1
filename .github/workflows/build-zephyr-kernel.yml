@@ -1,0 +1,176 @@
+name: Build Zephyr Kernel
+
+run-name: Zephyr 6.1 ${{ inputs.source_branch }} / LTO=${{ inputs.lto }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: Kernel source branch
+        required: true
+        default: android14-6.1-luminaire
+        type: choice
+        options:
+          - android14-6.1-luminaire
+          - android14-6.1-staging
+
+      lto:
+        description: Link Time Optimization mode
+        required: true
+        default: none
+        type: choice
+        options:
+          - none
+          - thin
+          - full
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zephyr-kernel-${{ inputs.source_branch }}-${{ inputs.lto }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ARM64 GKI / ${{ inputs.lto }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      SOURCE_BRANCH: ${{ inputs.source_branch }}
+      LTO_MODE: ${{ inputs.lto }}
+      WORKSPACE_DIR: ${{ github.workspace }}/kernel-workspace
+      DIST_DIR: ${{ github.workspace }}/dist
+
+    steps:
+      - name: Show runner resources
+        run: |
+          set -euxo pipefail
+          nproc
+          free -h
+          df -h /
+
+      - name: Free disk space
+        run: |
+          set -euxo pipefail
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          df -h /
+
+      - name: Install repo tool
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
+            -o "$HOME/bin/repo"
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Initialize Android kernel workspace
+        run: |
+          set -euxo pipefail
+          mkdir -p "$WORKSPACE_DIR"
+          cd "$WORKSPACE_DIR"
+
+          "$HOME/bin/repo" init \
+            -u https://android.googlesource.com/kernel/manifest \
+            -b common-android14-6.1 \
+            --depth=1
+
+          "$HOME/bin/repo" sync \
+            -c \
+            --no-tags \
+            --no-clone-bundle \
+            -j4
+
+      - name: Switch common source to Zephyr
+        run: |
+          set -euxo pipefail
+          cd "$WORKSPACE_DIR/common"
+
+          git remote remove zephyr 2>/dev/null || true
+          git remote add zephyr \
+            "https://github.com/${GITHUB_REPOSITORY}.git"
+
+          git fetch --depth=1 zephyr "$SOURCE_BRANCH"
+          git checkout --detach FETCH_HEAD
+
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          SOURCE_SUBJECT="$(git log -1 --pretty=%s)"
+
+          echo "SOURCE_SHA=$SOURCE_SHA" >> "$GITHUB_ENV"
+          echo "SOURCE_SUBJECT=$SOURCE_SUBJECT" >> "$GITHUB_ENV"
+
+          {
+            echo "### Zephyr source"
+            echo ""
+            echo "- Branch: \`$SOURCE_BRANCH\`"
+            echo "- Commit: \`$SOURCE_SHA\`"
+            echo "- Subject: $SOURCE_SUBJECT"
+            echo "- LTO: \`$LTO_MODE\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify toolchain
+        run: |
+          set -euxo pipefail
+          cd "$WORKSPACE_DIR"
+
+          test -x tools/bazel
+          test -f common/arch/arm64/configs/gki_defconfig
+
+          CLANG_VERSION="$(
+            sed -n 's/^CLANG_VERSION=//p' \
+            common/build.config.constants
+          )"
+
+          CLANG_BIN="prebuilts/clang/host/linux-x86/clang-${CLANG_VERSION}/bin/clang"
+
+          test -x "$CLANG_BIN"
+
+          echo "CLANG_VERSION=$CLANG_VERSION" >> "$GITHUB_ENV"
+          "$CLANG_BIN" --version
+
+      - name: Build ARM64 GKI
+        run: |
+          set -euxo pipefail
+          cd "$WORKSPACE_DIR"
+
+          rm -rf "$DIST_DIR"
+          mkdir -p "$DIST_DIR"
+
+          tools/bazel run \
+            --lto="$LTO_MODE" \
+            //common:kernel_aarch64_dist \
+            -- \
+            --destdir="$DIST_DIR"
+
+      - name: Add build information
+        if: success()
+        run: |
+          set -euxo pipefail
+
+          {
+            echo "ZephyrKernel-6.1"
+            echo "source_branch=$SOURCE_BRANCH"
+            echo "source_sha=$SOURCE_SHA"
+            echo "source_subject=$SOURCE_SUBJECT"
+            echo "lto=$LTO_MODE"
+            echo "clang=$CLANG_VERSION"
+            echo "github_run=${GITHUB_RUN_NUMBER}"
+          } > "$DIST_DIR/build-info.txt"
+
+          cd "$DIST_DIR"
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZephyrKernel-6.1-${{ inputs.source_branch }}-${{ inputs.lto }}-run${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
