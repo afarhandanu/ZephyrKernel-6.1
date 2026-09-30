@@ -233,6 +233,21 @@ jobs:
           test -d "$WORKSPACE_DIR/KernelSU"
           test -L "$WORKSPACE_DIR/common/drivers/kernelsu"
 
+          # Bazel's sandbox does not carry KernelSU/.git beside Kbuild.
+          # Point KSU_SRC to the checkout so ReSukiSU can read its metadata.
+          KSU_KBUILD="$WORKSPACE_DIR/common/drivers/kernelsu/Kbuild"
+          test -f "$KSU_KBUILD"
+          test -d "$WORKSPACE_DIR/KernelSU/.git"
+          grep -F 'KSU_SRC := $(realpath ' "$KSU_KBUILD"
+
+          sed -i \
+            "s|^KSU_SRC := .*|KSU_SRC := $WORKSPACE_DIR/KernelSU/kernel|" \
+            "$KSU_KBUILD"
+
+          grep -Fx \
+            "KSU_SRC := $WORKSPACE_DIR/KernelSU/kernel" \
+            "$KSU_KBUILD"
+
           KSU_SHA="$(
             git -C "$WORKSPACE_DIR/KernelSU" rev-parse HEAD
           )"
