@@ -24,6 +24,18 @@ on:
           - thin
           - full
 
+      local_version:
+        description: Custom Local Version (include leading -)
+        required: true
+        default: -Zephyr
+        type: string
+
+      build_identity:
+        description: Custom Build Identity (user@host)
+        required: true
+        default: afarhandanu@ZephyrCI
+        type: string
+
 permissions:
   contents: read
 
@@ -40,6 +52,8 @@ jobs:
     env:
       SOURCE_BRANCH: ${{ inputs.source_branch }}
       LTO_MODE: ${{ inputs.lto }}
+      LOCAL_VERSION: ${{ inputs.local_version }}
+      BUILD_IDENTITY: ${{ inputs.build_identity }}
 
       WORKSPACE_DIR: ${{ github.workspace }}/kernel-workspace
       DIST_DIR: ${{ github.workspace }}/dist
@@ -427,11 +441,23 @@ jobs:
         run: |
           set -euxo pipefail
 
+          if [[ ! "$LOCAL_VERSION" =~ ^-[A-Za-z0-9._-]+$ ]]; then
+            echo 'Local Version must start with - and contain only letters, digits, dots, underscores or hyphens.'
+            exit 1
+          fi
+
+          if [[ ! "$BUILD_IDENTITY" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$ ]]; then
+            echo 'Build Identity must have the form user@host.'
+            exit 1
+          fi
+
+          BUILD_USER="${BUILD_IDENTITY%@*}"
+          BUILD_HOST="${BUILD_IDENTITY#*@}"
           FRAGMENT="$WORKSPACE_DIR/common/arch/arm64/configs/zephyr.fragment"
 
-          cat > "$FRAGMENT" <<'EOF'
-          CONFIG_LOCALVERSION="-Zephyr"
+          printf 'CONFIG_LOCALVERSION="%s"\n' "$LOCAL_VERSION" > "$FRAGMENT"
 
+          cat >> "$FRAGMENT" <<'EOF'
           CONFIG_KSU=y
           CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
           CONFIG_KSU_SUSFS=y
@@ -463,15 +489,36 @@ jobs:
             's/POST_DEFCONFIG_CMDS="check_defconfig"/POST_DEFCONFIG_CMDS=""/' \
             "$WORKSPACE_DIR/common/build.config.gki"
 
-          #
-          # Cosmetic build identity
-          #
+          # Kleaf's setup environment overrides build.config.common.
+          # Set the identity where Bazel actually creates the kernel environment.
+          python3 - "$WORKSPACE_DIR/build/kernel" "$BUILD_USER" "$BUILD_HOST" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
 
-          cat >> "$WORKSPACE_DIR/common/build.config.common" <<'EOF'
+          build_dir = Path(sys.argv[1])
+          user, host = sys.argv[2:]
+          setup = build_dir / "_setup_env.sh"
+          data = setup.read_text()
 
-          KBUILD_BUILD_USER=afarhandanu
-          KBUILD_BUILD_HOST=ZephyrCI
-          EOF
+          for key, value, original in (
+              ("USER", user, "build-user"),
+              ("HOST", host, "build-host"),
+          ):
+              pattern = rf"(?m)^([ \t]*export KBUILD_BUILD_{key}=){original}$"
+              data, count = re.subn(pattern, lambda m: m.group(1) + value, data)
+              if count != 1:
+                  raise SystemExit(f"Expected one KBUILD_BUILD_{key} assignment in {setup}; found {count}")
+
+          setup.write_text(data)
+
+          # Newer Kleaf revisions also set the user after sourcing _setup_env.sh.
+          kleaf = build_dir / "kleaf/impl/kernel_env.bzl"
+          if kleaf.exists():
+              data = kleaf.read_text()
+              data = data.replace("export KBUILD_BUILD_USER=kleaf", f"export KBUILD_BUILD_USER={user}")
+              kleaf.write_text(data)
+          PY
 
       - name: Prepare release name
         shell: bash
@@ -517,7 +564,11 @@ jobs:
 
           mkdir -p "$DIST_DIR"
 
+          # --config=stamp enables Kleaf workspace stamping so the kernel
+          # version uses real git metadata instead of the hardcoded
+          # '-maybe-dirty' placeholder (see kleaf/impl/stamp.bzl).
           tools/bazel run \
+            --config=stamp \
             --lto="$LTO_MODE" \
             --defconfig_fragment=//common:arch/arm64/configs/zephyr.fragment \
             //common:kernel_aarch64_dist \
@@ -664,9 +715,7 @@ jobs:
 
           echo "=== LOCALVERSION ==="
 
-          grep '^CONFIG_LOCALVERSION' \
-            "$CONFIG" \
-            || true
+          grep -Fx "CONFIG_LOCALVERSION=\"$LOCAL_VERSION\"" "$CONFIG"
 
       - name: Verify ReSukiSU SUSFS and branding
         shell: bash
@@ -691,9 +740,25 @@ jobs:
 
           echo "$KERNEL_STRING"
 
-          if ! echo "$KERNEL_STRING" | grep -q 'Zephyr'; then
+          if [[ "$KERNEL_STRING" != *"$LOCAL_VERSION"* ]]; then
 
-            echo "Zephyr branding not found."
+            echo "Selected Local Version not found."
+
+            exit 1
+
+          fi
+
+          if [[ "$KERNEL_STRING" != *"($BUILD_IDENTITY)"* ]]; then
+
+            echo "Selected Build Identity not found."
+
+            exit 1
+
+          fi
+
+          if [[ "$KERNEL_STRING" == *maybe-dirty* ]]; then
+
+            echo "Stale '-maybe-dirty' scmversion detected."
 
             exit 1
 
@@ -883,6 +948,8 @@ jobs:
             echo "root=ReSukiSU"
             echo "susfs=enabled"
             echo "lto=$LTO_MODE"
+            echo "local_version=${{ inputs.local_version }}"
+            echo "build_identity=${{ inputs.build_identity }}"
             echo "clang=$CLANG_VERSION"
             echo ""
             echo "source_branch=$SOURCE_BRANCH"
