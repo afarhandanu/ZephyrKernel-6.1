@@ -1,6 +1,6 @@
 name: Build Zephyr Kernel
 
-run-name: Zephyr 6.1 ${{ inputs.source_branch }} / LTO=${{ inputs.lto }}
+run-name: Zephyr 6.1 ${{ inputs.source_branch }} / ${{ inputs.root }}${{ inputs.susfs == 'yes' && '+SUSFS' || '' }} / LTO=${{ inputs.lto }} / TC=${{ inputs.toolchain }}
 
 on:
   workflow_dispatch:
@@ -24,26 +24,93 @@ on:
           - thin
           - full
 
+      toolchain:
+        description: Clang toolchain
+        required: true
+        default: aosp
+        type: choice
+        options:
+          - aosp
+          - neutron
+          - zyc
+
+      root:
+        description: Root solution
+        required: true
+        default: resukisu
+        type: choice
+        options:
+          - resukisu
+          - kernelsu
+          - kernelsu-next
+          - kowsu
+          - sukisu-ultra
+          - vanilla
+
+      susfs:
+        description: Include SUSFS (only supported with ReSukiSU)
+        required: true
+        default: 'yes'
+        type: choice
+        options:
+          - 'yes'
+          - 'no'
+
+      local_version:
+        description: Custom Local Version (include leading -)
+        required: true
+        default: -Zephyr
+        type: string
+
+      build_identity:
+        description: Custom Build Identity (user@host)
+        required: true
+        default: afarhandanu@ZephyrCI
+        type: string
+
 permissions:
   contents: read
 
 concurrency:
-  group: zephyr-kernel-${{ inputs.source_branch }}-${{ inputs.lto }}
+  group: zephyr-${{ inputs.source_branch }}-${{ inputs.lto }}-${{ inputs.toolchain }}-${{ inputs.root }}-susfs${{ inputs.susfs }}
   cancel-in-progress: false
 
 jobs:
   build:
-    name: ARM64 GKI / ${{ inputs.lto }}
+    name: ARM64 GKI / ${{ inputs.root }}${{ inputs.susfs == 'yes' && '+SUSFS' || '' }} / ${{ inputs.lto }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     env:
       SOURCE_BRANCH: ${{ inputs.source_branch }}
       LTO_MODE: ${{ inputs.lto }}
+      LOCAL_VERSION: ${{ inputs.local_version }}
+      BUILD_IDENTITY: ${{ inputs.build_identity }}
+      TOOLCHAIN: ${{ inputs.toolchain }}
+      ROOT_SOLUTION: ${{ inputs.root }}
+      SUSFS_ENABLED: ${{ inputs.susfs }}
+
+      # Pinned Neutron Clang build (Clang 24.0.0). Only used when
+      # toolchain == neutron. Bump to a newer catalogue tag as needed.
+      NEUTRON_TAG: 06092026
+
+      # Pinned ZyC-Clang release (Clang 16.0.6). Only used when
+      # toolchain == zyc.
+      ZYC_TAG: 16.0.6-20260807-release
+
       WORKSPACE_DIR: ${{ github.workspace }}/kernel-workspace
       DIST_DIR: ${{ github.workspace }}/dist
       RELEASE_DIR: ${{ github.workspace }}/release
       AK3_DIR: ${{ github.workspace }}/AnyKernel3
+      SUSFS_DIR: ${{ github.workspace }}/susfs4ksu
+
+      # Pin revisions for reproducible builds.
+      RESUKISU_COMMIT: 94dd3c93c2053a84fd752df6eb85db99b7d70ab8
+      KERNELSU_REF: v3.3.0
+      KERNELSU_NEXT_REF: v3.4.0
+      KOWSU_REF: main
+      SUKISU_ULTRA_REF: v4.2.0
+      SUSFS_COMMIT: 24743360ea08d98f6ad72b856851abed8de5854f
 
     steps:
       - name: Show runner resources
@@ -79,12 +146,15 @@ jobs:
           set -euxo pipefail
 
           sudo apt-get update
+
           sudo apt-get install -y \
             curl \
             git \
+            patch \
             zip \
             unzip \
-            file
+            file \
+            binutils
 
       - name: Install repo tool
         shell: bash
@@ -109,6 +179,7 @@ jobs:
           set -euxo pipefail
 
           mkdir -p "$WORKSPACE_DIR"
+
           cd "$WORKSPACE_DIR"
 
           "$HOME/bin/repo" init \
@@ -122,7 +193,7 @@ jobs:
             --no-clone-bundle \
             -j4
 
-          echo "=== DISK AFTER REPO SYNC ==="
+          echo "=== DISK AFTER SYNC ==="
           df -h /
 
       - name: Switch common source to Zephyr
@@ -154,14 +225,12 @@ jobs:
           echo "Branch  : $SOURCE_BRANCH"
           echo "Commit  : $SOURCE_SHA"
           echo "Subject : $SOURCE_SUBJECT"
-          echo "LTO     : $LTO_MODE"
 
           {
             echo "## Zephyr Kernel Build"
             echo ""
-            echo "- Branch: \`$SOURCE_BRANCH\`"
+            echo "- Source: \`$SOURCE_BRANCH\`"
             echo "- Commit: \`$SOURCE_SHA\`"
-            echo "- Subject: $SOURCE_SUBJECT"
             echo "- LTO: \`$LTO_MODE\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -172,23 +241,99 @@ jobs:
 
           cd "$WORKSPACE_DIR/common"
 
-          VERSION="$(
-            sed -n 's/^VERSION = //p' Makefile
-          )"
-
-          PATCHLEVEL="$(
-            sed -n 's/^PATCHLEVEL = //p' Makefile
-          )"
-
-          SUBLEVEL="$(
-            sed -n 's/^SUBLEVEL = //p' Makefile
-          )"
+          VERSION="$(sed -n 's/^VERSION = //p' Makefile)"
+          PATCHLEVEL="$(sed -n 's/^PATCHLEVEL = //p' Makefile)"
+          SUBLEVEL="$(sed -n 's/^SUBLEVEL = //p' Makefile)"
 
           KERNEL_VERSION="${VERSION}.${PATCHLEVEL}.${SUBLEVEL}"
 
           echo "KERNEL_VERSION=$KERNEL_VERSION" >> "$GITHUB_ENV"
 
           echo "Kernel version: $KERNEL_VERSION"
+
+      - name: Setup custom Clang toolchain
+        if: ${{ inputs.toolchain != 'aosp' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          TC_DL_DIR="$HOME/toolchains/dl"
+          mkdir -p "$TC_DL_DIR"
+
+          if [ "$TOOLCHAIN" = neutron ]; then
+            # Neutron Clang (pinned build) via AntMan.
+            # https://github.com/neutron-toolchains/clang-build-catalogue
+            NEUTRON_DIR="$TC_DL_DIR/neutron-clang"
+            mkdir -p "$NEUTRON_DIR"
+            cd "$NEUTRON_DIR"
+
+            curl -fsSL \
+              "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman" \
+              -o antman
+            chmod +x antman
+
+            ./antman -S="$NEUTRON_TAG"
+
+            TC_SRC="$NEUTRON_DIR"
+          elif [ "$TOOLCHAIN" = zyc ]; then
+            # ZyC-Clang (pinned release) via direct tarball.
+            # https://github.com/ZyCromerZ/Clang/releases
+            ZYC_DIR="$TC_DL_DIR/zyc-clang"
+            mkdir -p "$ZYC_DIR"
+
+            curl -fsSL \
+              "https://github.com/ZyCromerZ/Clang/releases/download/${ZYC_TAG}/Clang-${ZYC_TAG}.tar.gz" \
+              -o /tmp/zyc-clang.tar.gz
+
+            tar -xzf /tmp/zyc-clang.tar.gz -C "$ZYC_DIR" --strip-components=1
+            rm -f /tmp/zyc-clang.tar.gz
+
+            TC_SRC="$ZYC_DIR"
+          else
+            echo "Unknown toolchain: $TOOLCHAIN" >&2
+            exit 1
+          fi
+
+          # Resolve the toolchain root (defensive: archive may nest it one level).
+          TC_ROOT="$TC_SRC"
+          if [ ! -x "$TC_ROOT/bin/clang" ]; then
+            SUB="$(find "$TC_ROOT" -maxdepth 2 -name clang -path '*/bin/*' -print -quit)"
+            test -n "$SUB"
+            TC_ROOT="$(dirname "$(dirname "$SUB")")"
+          fi
+          test -x "$TC_ROOT/bin/clang"
+          "$TC_ROOT/bin/clang" --version
+
+          # Swap the manifest's prebuilt clang payload with the custom one so
+          # kleaf picks it up. The versioned directory NAME is kept (it must
+          # stay valid per kleaf/versions.bzl); only the binaries change.
+          # Any Bazel/Soong metadata files in the directory are preserved.
+          cd "$WORKSPACE_DIR"
+
+          CLANG_VERSION="$(
+            sed -n 's/^CLANG_VERSION=//p' \
+            common/build.config.constants
+          )"
+          test -n "$CLANG_VERSION"
+
+          TARGET="prebuilts/clang/host/linux-x86/clang-${CLANG_VERSION}"
+          test -d "$TARGET"
+
+          META_TMP="$(mktemp -d)"
+          find "$TARGET" -maxdepth 1 -type f \
+            \( -name 'BUILD*' -o -name '*.bzl' -o -name 'Android.bp' \
+               -o -name '*.mk' -o -name 'METADATA' -o -name 'OWNERS' \) \
+            -exec cp -p {} "$META_TMP/" \;
+
+          rm -rf "$TARGET"
+          mkdir -p "$TARGET"
+          cp -a "$TC_ROOT/." "$TARGET/"
+          cp -p "$META_TMP/"* "$TARGET/" 2>/dev/null || true
+          rm -rf "$META_TMP"
+
+          test -x "$TARGET/bin/clang"
+          echo "=== SWAPPED CLANG ($TOOLCHAIN) ==="
+          "$TARGET/bin/clang" --version
 
       - name: Verify toolchain
         shell: bash
@@ -212,8 +357,441 @@ jobs:
 
           echo "CLANG_VERSION=$CLANG_VERSION" >> "$GITHUB_ENV"
 
+          CLANG_DESC="$("$CLANG_BIN" --version | head -n 1)"
+          echo "CLANG_DESC=$CLANG_DESC" >> "$GITHUB_ENV"
+
           echo "=== CLANG ==="
           "$CLANG_BIN" --version
+
+      - name: Validate root/SUSFS combination
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Root solution: $ROOT_SOLUTION"
+          echo "SUSFS: $SUSFS_ENABLED"
+
+          if [ "$SUSFS_ENABLED" = "yes" ] && [ "$ROOT_SOLUTION" != "resukisu" ]; then
+            case "$ROOT_SOLUTION" in
+              vanilla)
+                REASON="a vanilla build has no root driver for SUSFS to pair with"
+                ;;
+              kowsu)
+                REASON="KowSU has no SUSFS pairing upstream"
+                ;;
+              kernelsu)
+                REASON="the tiann KernelSU driver has no SUSFS support"
+                ;;
+              *)
+                REASON="SUSFS pairing for '$ROOT_SOLUTION' is not wired in this workflow yet"
+                ;;
+            esac
+            echo "ERROR: SUSFS=yes is only supported with root=resukisu ($REASON)." >&2
+            echo "Re-run with susfs=no, or pick root=resukisu." >&2
+            exit 1
+          fi
+
+          echo "Combination OK."
+
+      - name: Integrate root solution
+        if: ${{ inputs.root != 'vanilla' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          case "$ROOT_SOLUTION" in
+            resukisu)
+              KSU_REPO="ReSukiSU/ReSukiSU"
+              KSU_REF="$RESUKISU_COMMIT"
+              ;;
+            kernelsu)
+              KSU_REPO="tiann/KernelSU"
+              KSU_REF="$KERNELSU_REF"
+              ;;
+            kernelsu-next)
+              KSU_REPO="KernelSU-Next/KernelSU-Next"
+              KSU_REF="$KERNELSU_NEXT_REF"
+              ;;
+            kowsu)
+              KSU_REPO="KOWX712/KernelSU"
+              KSU_REF="$KOWSU_REF"
+              ;;
+            sukisu-ultra)
+              KSU_REPO="SukiSU-Ultra/SukiSU-Ultra"
+              KSU_REF="$SUKISU_ULTRA_REF"
+              ;;
+            *)
+              echo "Unknown root solution: $ROOT_SOLUTION" >&2
+              exit 1
+              ;;
+          esac
+
+          echo "=== ROOT SOLUTION ==="
+          echo "Repo: $KSU_REPO"
+          echo "Ref:  $KSU_REF"
+
+          cd "$WORKSPACE_DIR"
+
+          curl -LSs \
+            "https://raw.githubusercontent.com/${KSU_REPO}/${KSU_REF}/kernel/setup.sh" \
+            -o /tmp/ksu-setup.sh
+
+          chmod +x /tmp/ksu-setup.sh
+
+          /tmp/ksu-setup.sh "$KSU_REF"
+
+          test -d "$WORKSPACE_DIR/KernelSU"
+          test -L "$WORKSPACE_DIR/common/drivers/kernelsu"
+
+          # Bazel's sandbox does not carry KernelSU/.git beside Kbuild.
+          # Point KSU_SRC to the checkout when the Kbuild resolves it
+          # via realpath (tolerated when a variant does not use it).
+          KSU_KBUILD="$WORKSPACE_DIR/common/drivers/kernelsu/Kbuild"
+          test -f "$KSU_KBUILD"
+
+          if grep -q 'KSU_SRC := $(realpath ' "$KSU_KBUILD"; then
+            sed -i \
+              "s|^KSU_SRC := .*|KSU_SRC := $WORKSPACE_DIR/KernelSU/kernel|" \
+              "$KSU_KBUILD"
+
+            grep -Fx \
+              "KSU_SRC := $WORKSPACE_DIR/KernelSU/kernel" \
+              "$KSU_KBUILD"
+          else
+            echo "KSU Kbuild does not resolve KSU_SRC via realpath; no fix needed."
+          fi
+
+          KSU_SHA="$(
+            git -C "$WORKSPACE_DIR/KernelSU" rev-parse HEAD
+          )"
+
+          echo "KSU_SHA=$KSU_SHA" >> "$GITHUB_ENV"
+          echo "KSU_REPO=$KSU_REPO" >> "$GITHUB_ENV"
+          echo "KSU_REF=$KSU_REF" >> "$GITHUB_ENV"
+
+          echo "=== ROOT INTEGRATED ==="
+          echo "Commit: $KSU_SHA"
+
+      - name: Fetch SUSFS
+        if: ${{ inputs.susfs == 'yes' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          rm -rf "$SUSFS_DIR"
+
+          git init "$SUSFS_DIR"
+
+          git -C "$SUSFS_DIR" remote add origin \
+            https://gitlab.com/simonpunk/susfs4ksu.git
+
+          git -C "$SUSFS_DIR" fetch \
+            --depth=1 \
+            origin \
+            "$SUSFS_COMMIT"
+
+          git -C "$SUSFS_DIR" checkout \
+            --detach \
+            FETCH_HEAD
+
+          SUSFS_SHA="$(
+            git -C "$SUSFS_DIR" rev-parse HEAD
+          )"
+
+          echo "SUSFS_SHA=$SUSFS_SHA" >> "$GITHUB_ENV"
+
+          echo "=== SUSFS ==="
+          echo "Commit: $SUSFS_SHA"
+
+          test "$SUSFS_SHA" = "$SUSFS_COMMIT"
+
+      - name: Apply SUSFS kernel patch
+        if: ${{ inputs.susfs == 'yes' }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          PATCH_FILE="$SUSFS_DIR/kernel_patches/50_add_susfs_in_gki-android14-6.1.patch"
+          NAMESPACE_FILE="$WORKSPACE_DIR/common/fs/namespace.c"
+
+          test -f "$PATCH_FILE"
+          test -f "$NAMESPACE_FILE"
+
+          echo "=== COPY SUSFS SOURCE ==="
+
+          cp "$SUSFS_DIR"/kernel_patches/fs/* \
+            "$WORKSPACE_DIR/common/fs/"
+
+          cp "$SUSFS_DIR"/kernel_patches/include/linux/* \
+            "$WORKSPACE_DIR/common/include/linux/"
+
+          test -s "$WORKSPACE_DIR/common/fs/susfs.c"
+          test -s "$WORKSPACE_DIR/common/include/linux/susfs.h"
+          test -s "$WORKSPACE_DIR/common/include/linux/susfs_def.h"
+
+          cd "$WORKSPACE_DIR/common"
+
+          #
+          # Luminaire has one Android-specific trace hook exactly
+          # where the SUSFS namespace patch expects upstream context.
+          #
+          # Remove ONLY this line temporarily, apply SUSFS strictly
+          # with fuzz=0, then restore it.
+          #
+
+          TRACE_HOOK_PRESENT=0
+
+          if grep -Fxq '#include <trace/hooks/blk.h>' fs/namespace.c; then
+
+            TRACE_HOOK_PRESENT=1
+
+            echo "Luminaire blk trace hook detected."
+
+            sed -i \
+              '\|#include <trace/hooks/blk.h>|d' \
+              fs/namespace.c
+
+          fi
+
+          echo "=== SUSFS STRICT DRY RUN ==="
+
+          patch \
+            --dry-run \
+            -p1 \
+            -F0 \
+            --no-backup-if-mismatch \
+            < "$PATCH_FILE"
+
+          echo "=== APPLY SUSFS ==="
+
+          patch \
+            -p1 \
+            -F0 \
+            --no-backup-if-mismatch \
+            < "$PATCH_FILE"
+
+          echo "=== RESTORE LUMINAIRE TRACE HOOK ==="
+
+          if [ "$TRACE_HOOK_PRESENT" = "1" ]; then
+
+            sed -i \
+              '/#include "internal.h"/a #include <trace/hooks/blk.h>' \
+              fs/namespace.c
+
+          fi
+
+          echo "=== VERIFY LUMINAIRE TRACE HOOK ==="
+
+          if [ "$TRACE_HOOK_PRESENT" = "1" ]; then
+
+            grep -Fx \
+              '#include <trace/hooks/blk.h>' \
+              fs/namespace.c
+
+          fi
+
+          echo "=== VERIFY SUSFS SOURCE ==="
+
+          test -s fs/susfs.c
+          test -s include/linux/susfs.h
+          test -s include/linux/susfs_def.h
+
+          grep -F \
+            '#include <linux/susfs_def.h>' \
+            fs/namespace.c
+
+          grep -F \
+            'CONFIG_KSU_SUSFS' \
+            fs/Makefile
+
+          #
+          # Do not verify internal SUSFS variable names here.
+          # Internal names can change between SUSFS revisions.
+          #
+          # The actual features will be verified later against:
+          #
+          #   1. final embedded kernel .config
+          #   2. final compiled Image strings
+          #
+
+          echo "=== CHECK REJECTED HUNKS ==="
+
+          if find . -name '*.rej' | grep -q .; then
+
+            echo "SUSFS generated rejected hunks:"
+
+            find . -name '*.rej' -print
+
+            while IFS= read -r rej; do
+
+              echo "================================="
+              echo "$rej"
+              echo "================================="
+
+              cat "$rej"
+
+            done < <(find . -name '*.rej')
+
+            exit 1
+
+          fi
+
+          echo "=== SUSFS PATCH APPLIED SUCCESSFULLY ==="
+          echo "Fuzz level: 0"
+
+      - name: Configure Zephyr
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          if [[ ! "$LOCAL_VERSION" =~ ^-[A-Za-z0-9._-]+$ ]]; then
+            echo 'Local Version must start with - and contain only letters, digits, dots, underscores or hyphens.'
+            exit 1
+          fi
+
+          if [[ ! "$BUILD_IDENTITY" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$ ]]; then
+            echo 'Build Identity must have the form user@host.'
+            exit 1
+          fi
+
+          BUILD_USER="${BUILD_IDENTITY%@*}"
+          BUILD_HOST="${BUILD_IDENTITY#*@}"
+          FRAGMENT="$WORKSPACE_DIR/common/arch/arm64/configs/zephyr.fragment"
+
+          printf 'CONFIG_LOCALVERSION="%s"\n' "$LOCAL_VERSION" > "$FRAGMENT"
+
+          if [ "$ROOT_SOLUTION" != "vanilla" ]; then
+            cat >> "$FRAGMENT" <<'EOF'
+          CONFIG_KSU=y
+          EOF
+          fi
+
+          if [ "$ROOT_SOLUTION" = "resukisu" ]; then
+            cat >> "$FRAGMENT" <<'EOF'
+          CONFIG_KSU_MULTI_MANAGER_SUPPORT=y
+          EOF
+          fi
+
+          if [ "$SUSFS_ENABLED" = "yes" ]; then
+            cat >> "$FRAGMENT" <<'EOF'
+          CONFIG_KSU_SUSFS=y
+
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          EOF
+          fi
+
+          cat >> "$FRAGMENT" <<'EOF'
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_TMPFS_POSIX_ACL=y
+          EOF
+
+          echo "=== ZEPHYR CONFIG FRAGMENT ==="
+
+          cat "$FRAGMENT"
+
+          #
+          # This is intentionally no longer Google's untouched
+          # canonical GKI defconfig.
+          #
+
+          sed -i \
+            's/POST_DEFCONFIG_CMDS="check_defconfig"/POST_DEFCONFIG_CMDS=""/' \
+            "$WORKSPACE_DIR/common/build.config.gki"
+
+          # Kleaf's setup environment overrides build.config.common.
+          # Set the identity where Bazel actually creates the kernel environment.
+          python3 - "$WORKSPACE_DIR/build/kernel" "$BUILD_USER" "$BUILD_HOST" <<'PY'
+          from pathlib import Path
+          import re
+          import sys
+
+          build_dir = Path(sys.argv[1])
+          user, host = sys.argv[2:]
+          setup = build_dir / "_setup_env.sh"
+          data = setup.read_text()
+
+          for key, value, original in (
+              ("USER", user, "build-user"),
+              ("HOST", host, "build-host"),
+          ):
+              pattern = rf"(?m)^([ \t]*export KBUILD_BUILD_{key}=){original}$"
+              data, count = re.subn(pattern, lambda m: m.group(1) + value, data)
+              if count != 1:
+                  raise SystemExit(f"Expected one KBUILD_BUILD_{key} assignment in {setup}; found {count}")
+
+          setup.write_text(data)
+
+          # Newer Kleaf revisions also set the user after sourcing _setup_env.sh.
+          kleaf = build_dir / "kleaf/impl/kernel_env.bzl"
+          if kleaf.exists():
+              data = kleaf.read_text()
+              data = data.replace("export KBUILD_BUILD_USER=kleaf", f"export KBUILD_BUILD_USER={user}")
+              kleaf.write_text(data)
+          PY
+
+      - name: Prepare release name
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          case "$LTO_MODE" in
+
+            none)
+              LTO_NAME="NoLTO"
+              ;;
+
+            thin)
+              LTO_NAME="ThinLTO"
+              ;;
+
+            full)
+              LTO_NAME="FullLTO"
+              ;;
+
+            *)
+              echo "Unknown LTO mode: $LTO_MODE"
+              exit 1
+              ;;
+
+          esac
+
+          case "$ROOT_SOLUTION" in
+            resukisu)      ROOT_LABEL="ReSukiSU" ;;
+            kernelsu)      ROOT_LABEL="KernelSU" ;;
+            kernelsu-next) ROOT_LABEL="KernelSU-Next" ;;
+            kowsu)         ROOT_LABEL="KowSU" ;;
+            sukisu-ultra)  ROOT_LABEL="SukiSU-Ultra" ;;
+            vanilla)       ROOT_LABEL="Vanilla" ;;
+            *)
+              echo "Unknown root solution: $ROOT_SOLUTION" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ "$SUSFS_ENABLED" = "yes" ]; then
+            SUSFS_LABEL="+SUSFS"
+            ROOT_DISPLAY="$ROOT_LABEL + SUSFS"
+          else
+            SUSFS_LABEL=""
+            ROOT_DISPLAY="$ROOT_LABEL"
+          fi
+
+          ZIP_NAME="ZephyrKernel-${KERNEL_VERSION}-${ROOT_LABEL}${SUSFS_LABEL}-${LTO_NAME}.zip"
+
+          echo "LTO_NAME=$LTO_NAME" >> "$GITHUB_ENV"
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+          echo "ROOT_LABEL=$ROOT_LABEL" >> "$GITHUB_ENV"
+          echo "ROOT_DISPLAY=$ROOT_DISPLAY" >> "$GITHUB_ENV"
+
+          echo "ZIP: $ZIP_NAME"
 
       - name: Build ARM64 GKI
         shell: bash
@@ -223,62 +801,271 @@ jobs:
           cd "$WORKSPACE_DIR"
 
           rm -rf "$DIST_DIR"
+
           mkdir -p "$DIST_DIR"
 
+          # --config=stamp enables Kleaf workspace stamping so the kernel
+          # version uses real git metadata instead of the hardcoded
+          # '-maybe-dirty' placeholder (see kleaf/impl/stamp.bzl).
           tools/bazel run \
+            --config=stamp \
             --lto="$LTO_MODE" \
+            --defconfig_fragment=//common:arch/arm64/configs/zephyr.fragment \
             //common:kernel_aarch64_dist \
             -- \
             --destdir="$DIST_DIR"
 
-          echo "=== BUILD COMPLETED ==="
-
-          test -f "$DIST_DIR/Image"
-
-          ls -lh "$DIST_DIR/Image"
-
-      - name: Verify kernel Image
-        shell: bash
-        run: |
-          set -euxo pipefail
+          echo "=== BUILD COMPLETE ==="
 
           test -s "$DIST_DIR/Image"
 
-          echo "=== IMAGE INFORMATION ==="
-
           ls -lh "$DIST_DIR/Image"
 
-          file "$DIST_DIR/Image"
-
-          sha256sum "$DIST_DIR/Image"
-
-      - name: Prepare release name
+      - name: Extract embedded kernel config
         shell: bash
         run: |
           set -euxo pipefail
 
-          case "$LTO_MODE" in
-            none)
-              LTO_NAME="NoLTO"
-              ;;
-            thin)
-              LTO_NAME="ThinLTO"
-              ;;
-            full)
-              LTO_NAME="FullLTO"
-              ;;
-            *)
-              echo "Unknown LTO mode: $LTO_MODE"
+          mkdir -p "$RELEASE_DIR"
+
+          python3 <<'PY'
+          import gzip
+          from pathlib import Path
+
+          image = Path("dist/Image")
+
+          data = image.read_bytes()
+
+          start = data.find(b"IKCFG_ST")
+
+          if start < 0:
+              raise SystemExit(
+                  "IKCFG_ST not found in kernel Image"
+              )
+
+          end = data.find(
+              b"IKCFG_ED",
+              start + len(b"IKCFG_ST")
+          )
+
+          if end < 0:
+              raise SystemExit(
+                  "IKCFG_ED not found in kernel Image"
+              )
+
+          compressed = data[
+              start + len(b"IKCFG_ST"):end
+          ]
+
+          config = gzip.decompress(
+              compressed
+          ).decode(
+              "utf-8",
+              "replace"
+          )
+
+          Path(
+              "release/kernel.config"
+          ).write_text(
+              config
+          )
+          PY
+
+          test -s "$RELEASE_DIR/kernel.config"
+
+      - name: Verify kernel configuration
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          CONFIG="$RELEASE_DIR/kernel.config"
+
+          REQUIRED=(
+            'CONFIG_CFI_CLANG=y'
+          )
+
+          if [ "$ROOT_SOLUTION" != "vanilla" ]; then
+            REQUIRED+=('CONFIG_KSU=y')
+          fi
+
+          if [ "$ROOT_SOLUTION" = "resukisu" ]; then
+            REQUIRED+=('CONFIG_KSU_MULTI_MANAGER_SUPPORT=y')
+          fi
+
+          if [ "$SUSFS_ENABLED" = "yes" ]; then
+            REQUIRED+=(
+              'CONFIG_KSU_SUSFS=y'
+              'CONFIG_KSU_SUSFS_SUS_PATH=y'
+              'CONFIG_KSU_SUSFS_SUS_MOUNT=y'
+              'CONFIG_KSU_SUSFS_SUS_KSTAT=y'
+              'CONFIG_KSU_SUSFS_SPOOF_UNAME=y'
+              'CONFIG_KSU_SUSFS_ENABLE_LOG=y'
+              'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y'
+              'CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y'
+              'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y'
+              'CONFIG_KSU_SUSFS_SUS_MAP=y'
+            )
+          fi
+
+          echo "=== VERIFY REQUIRED CONFIG ==="
+
+          for OPTION in "${REQUIRED[@]}"; do
+
+            if ! grep -Fx "$OPTION" "$CONFIG"; then
+
+              echo "Missing required config:"
+              echo "$OPTION"
+
               exit 1
+
+            fi
+
+          done
+
+          echo "=== VERIFY LTO ==="
+
+          case "$LTO_MODE" in
+
+            none)
+
+              grep -Fx \
+                'CONFIG_LTO_NONE=y' \
+                "$CONFIG"
+
               ;;
+
+            thin)
+
+              grep -Fx \
+                'CONFIG_LTO_CLANG_THIN=y' \
+                "$CONFIG"
+
+              ;;
+
+            full)
+
+              grep -Fx \
+                'CONFIG_LTO_CLANG_FULL=y' \
+                "$CONFIG"
+
+              ;;
+
           esac
 
-          ZIP_NAME="ZephyrKernel-${KERNEL_VERSION}-VANILLA-${LTO_NAME}.zip"
+          echo "=== KSU CONFIG ==="
 
-          echo "LTO_NAME=$LTO_NAME" >> "$GITHUB_ENV"
-          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+          grep '^CONFIG_KSU' \
+            "$CONFIG" \
+            || true
 
-          echo "Release name: $ZIP_NAME"
+          echo "=== LTO CONFIG ==="
+
+          grep '^CONFIG_LTO' \
+            "$CONFIG" \
+            || true
+
+          echo "=== LOCALVERSION ==="
+
+          grep -Fx "CONFIG_LOCALVERSION=\"$LOCAL_VERSION\"" "$CONFIG"
+
+      - name: Verify root solution, SUSFS and branding
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "=== IMAGE INFORMATION ==="
+
+          file "$DIST_DIR/Image"
+
+          ls -lh "$DIST_DIR/Image"
+
+          sha256sum "$DIST_DIR/Image"
+
+          echo "=== KERNEL VERSION ==="
+
+          KERNEL_STRING="$(
+            strings "$DIST_DIR/Image" \
+              | grep -m1 '^Linux version ' \
+              || true
+          )"
+
+          echo "$KERNEL_STRING"
+
+          if [[ "$KERNEL_STRING" != *"$LOCAL_VERSION"* ]]; then
+
+            echo "Selected Local Version not found."
+
+            exit 1
+
+          fi
+
+          if [[ "$KERNEL_STRING" != *"($BUILD_IDENTITY)"* ]]; then
+
+            echo "Selected Build Identity not found."
+
+            exit 1
+
+          fi
+
+          if [[ "$KERNEL_STRING" == *maybe-dirty* ]]; then
+
+            echo "Stale '-maybe-dirty' scmversion detected."
+
+            exit 1
+
+          fi
+
+          echo "=== ROOT SOLUTION SIGNATURE ==="
+
+          if [ "$ROOT_SOLUTION" = "vanilla" ]; then
+
+            echo "Vanilla build: no root driver signature to check."
+
+          elif [ "$ROOT_SOLUTION" = "resukisu" ]; then
+
+            if ! strings "$DIST_DIR/Image" \
+              | grep -m1 \
+                'KernelSU: Initialized with driver version'; then
+
+              echo "ReSukiSU/KernelSU signature not found."
+
+              exit 1
+
+            fi
+
+          else
+
+            if ! strings "$DIST_DIR/Image" \
+              | grep -m1 -i \
+                'kernelsu'; then
+
+              echo "KernelSU driver signature not found."
+
+              exit 1
+
+            fi
+
+          fi
+
+          if [ "$SUSFS_ENABLED" = "yes" ]; then
+
+            echo "=== SUSFS SIGNATURE ==="
+
+            if ! strings "$DIST_DIR/Image" \
+              | grep -m1 \
+                'susfs is initialized! version'; then
+
+              echo "SUSFS signature not found."
+
+              exit 1
+
+            fi
+
+          else
+
+            echo "=== SUSFS DISABLED, SIGNATURE CHECK SKIPPED ==="
+
+          fi
 
       - name: Prepare AnyKernel3
         shell: bash
@@ -286,9 +1073,6 @@ jobs:
           set -euxo pipefail
 
           rm -rf "$AK3_DIR"
-          rm -rf "$RELEASE_DIR"
-
-          mkdir -p "$RELEASE_DIR"
 
           git clone \
             https://github.com/osm0sis/AnyKernel3.git \
@@ -296,22 +1080,22 @@ jobs:
 
           cd "$AK3_DIR"
 
-          # Pin AnyKernel3 to a known revision
           git checkout \
             020dfeccf9d7e962a48400fc94d3e451df92eead
 
-          # Remove repository/development files
-          rm -rf .git
-          rm -rf .github
-          rm -rf modules
-          rm -rf patch
-          rm -rf ramdisk
+          rm -rf \
+            .git \
+            .github \
+            modules \
+            patch \
+            ramdisk
 
-          rm -f README.md
-          rm -f LICENSE
+          rm -f \
+            README.md \
+            LICENSE
 
-          # Copy raw ARM64 kernel Image
-          cp "$DIST_DIR/Image" "$AK3_DIR/Image"
+          cp "$DIST_DIR/Image" \
+            "$AK3_DIR/Image"
 
           test -s "$AK3_DIR/Image"
 
@@ -329,7 +1113,7 @@ jobs:
           ### Zephyr Kernel
 
           properties() { '
-          kernel.string=Zephyr Kernel
+          kernel.string=Zephyr Kernel | ReSukiSU + SUSFS
           do.devicecheck=0
           do.modules=0
           do.systemless=0
@@ -346,8 +1130,6 @@ jobs:
           supported.vendorpatchlevels=
           '; }
 
-          ### AnyKernel install
-
           block=boot
           is_slot_device=auto
           ramdisk_compression=auto
@@ -361,19 +1143,30 @@ jobs:
           ui_print "          ZEPHYR KERNEL"
           ui_print "================================="
           ui_print " "
-          ui_print "  GKI: Android 14 / Kernel 6.1"
-          ui_print "  Variant: VANILLA"
+          ui_print "  ReSukiSU + SUSFS"
+          ui_print "  Android 14 GKI 6.1"
           ui_print " "
 
-          kernel_version=$(cat /proc/version | awk -F '-' '{print $1}' | awk '{print $3}')
+          kernel_version=$(
+            cat /proc/version \
+              | awk -F '-' '{print $1}' \
+              | awk '{print $3}'
+          )
 
           case "$kernel_version" in
+
             6.1*)
+
               ui_print "  Current Kernel: $kernel_version"
+
               ;;
+
             *)
-              abort "  Unsupported kernel: $kernel_version"
+
+              abort "  Unsupported Kernel: $kernel_version"
+
               ;;
+
           esac
 
           ui_print " "
@@ -382,12 +1175,19 @@ jobs:
           split_boot
 
           if [ -f "$SPLITIMG/ramdisk.cpio" ]; then
+
             ui_print "  Ramdisk detected."
+
             unpack_ramdisk
+
             write_boot
+
           else
+
             ui_print "  No ramdisk detected."
+
             flash_boot
+
           fi
 
           ui_print " "
@@ -396,6 +1196,9 @@ jobs:
           ui_print "================================="
           ui_print " "
           EOF
+
+          sed -i "s|ReSukiSU + SUSFS|$ROOT_DISPLAY|g" anykernel.sh
+          grep -F "Zephyr Kernel | $ROOT_DISPLAY" anykernel.sh
 
           chmod 755 anykernel.sh
 
@@ -423,12 +1226,25 @@ jobs:
             echo "ZephyrKernel"
             echo ""
             echo "kernel_version=$KERNEL_VERSION"
-            echo "variant=VANILLA"
+            echo "branding=Zephyr"
+            echo "root=$ROOT_SOLUTION"
+            echo "susfs=$SUSFS_ENABLED"
             echo "lto=$LTO_MODE"
+            echo "toolchain=${{ inputs.toolchain }}"
+            echo "local_version=${{ inputs.local_version }}"
+            echo "build_identity=${{ inputs.build_identity }}"
             echo "clang=$CLANG_VERSION"
+            echo "clang_desc=$CLANG_DESC"
+            echo ""
             echo "source_branch=$SOURCE_BRANCH"
             echo "source_sha=$SOURCE_SHA"
             echo "source_subject=$SOURCE_SUBJECT"
+            echo ""
+            echo "ksu_repo=${KSU_REPO:-none}"
+            echo "ksu_ref=${KSU_REF:-none}"
+            echo "ksu_sha=${KSU_SHA:-none}"
+            echo "susfs_sha=${SUSFS_SHA:-none}"
+            echo ""
             echo "github_run=$GITHUB_RUN_NUMBER"
           } > "$RELEASE_DIR/build-info.txt"
 
@@ -453,7 +1269,7 @@ jobs:
 
           unzip -l "$ZIP_NAME"
 
-          echo "=== EXTRACT KERNEL FOR VERIFICATION ==="
+          echo "=== EXTRACT IMAGE ==="
 
           unzip -p \
             "$ZIP_NAME" \
@@ -478,17 +1294,23 @@ jobs:
 
           {
             echo ""
-            echo "## Flashable Package"
+            echo "## Zephyr Kernel Package"
             echo ""
             echo "- Kernel: \`$KERNEL_VERSION\`"
-            echo "- Variant: \`VANILLA\`"
+            echo "- Branding: \`Zephyr\`"
+            echo "- Root: \`$ROOT_LABEL\`"
+            echo "- SUSFS: \`$SUSFS_ENABLED\`"
             echo "- LTO: \`$LTO_NAME\`"
-            echo "- File: \`$ZIP_NAME\`"
             echo "- Source: \`$SOURCE_SHA\`"
-            echo ""
-            echo '```text'
-            ls -lh "$ZIP_NAME"
-            echo '```'
+            if [ "$ROOT_SOLUTION" = "vanilla" ]; then
+              echo "- KSU: \`none (vanilla)\`"
+            else
+              echo "- KSU: \`$KSU_REPO@$KSU_REF ($KSU_SHA)\`"
+            fi
+            if [ "$SUSFS_ENABLED" = "yes" ]; then
+              echo "- SUSFS: \`$SUSFS_SHA\`"
+            fi
+            echo "- ZIP: \`$ZIP_NAME\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show disk usage
@@ -496,17 +1318,19 @@ jobs:
         shell: bash
         run: |
           echo "=== FINAL DISK USAGE ==="
+
           df -h /
 
       - name: Upload flashable kernel
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ZephyrKernel-${{ inputs.lto }}-run${{ github.run_number }}
+          name: ZephyrKernel-${{ inputs.root }}${{ inputs.susfs == 'yes' && '-SUSFS' || '-NoSUSFS' }}-${{ inputs.lto }}-run${{ github.run_number }}
           path: |
             release/*.zip
             release/build-info.txt
             release/SHA256SUMS.txt
+            release/kernel.config
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
