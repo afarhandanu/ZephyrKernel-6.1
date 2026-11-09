@@ -117,7 +117,8 @@ static void nft_synproxy_do_eval(const struct nft_synproxy *priv,
 		return;
 	}
 
-	if (nf_ip_checksum(skb, nft_hook(pkt), thoff, IPPROTO_TCP)) {
+	if (nf_checksum(skb, nft_hook(pkt), thoff, IPPROTO_TCP,
+			nft_pf(pkt))) {
 		regs->verdict.code = NF_DROP;
 		return;
 	}
@@ -273,7 +274,8 @@ static void nft_synproxy_destroy(const struct nft_ctx *ctx,
 	nft_synproxy_do_destroy(ctx);
 }
 
-static int nft_synproxy_dump(struct sk_buff *skb, const struct nft_expr *expr)
+static int nft_synproxy_dump(struct sk_buff *skb,
+			     const struct nft_expr *expr, bool reset)
 {
 	struct nft_synproxy *priv = nft_expr_priv(expr);
 

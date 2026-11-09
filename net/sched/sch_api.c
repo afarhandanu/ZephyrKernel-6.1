@@ -1372,7 +1372,7 @@ err_out5:
 		ops->destroy(sch);
 err_out3:
 	netdev_put(dev, &sch->dev_tracker);
-	qdisc_free(sch);
+	qdisc_free_rcu(sch);
 err_out2:
 	module_put(ops->owner);
 err_out:

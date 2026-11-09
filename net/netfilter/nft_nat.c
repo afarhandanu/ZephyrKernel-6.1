@@ -64,8 +64,8 @@ static void nft_nat_setup_netmap(struct nf_nat_range2 *range,
 				 const struct nft_pktinfo *pkt,
 				 const struct nft_nat *priv)
 {
+	union nf_inet_addr new_addr = {};
 	struct sk_buff *skb = pkt->skb;
-	union nf_inet_addr new_addr;
 	__be32 netmask;
 	int i, len = 0;
 
@@ -259,7 +259,8 @@ static int nft_nat_init(const struct nft_ctx *ctx, const struct nft_expr *expr,
 	return nf_ct_netns_get(ctx->net, family);
 }
 
-static int nft_nat_dump(struct sk_buff *skb, const struct nft_expr *expr)
+static int nft_nat_dump(struct sk_buff *skb,
+			const struct nft_expr *expr, bool reset)
 {
 	const struct nft_nat *priv = nft_expr_priv(expr);
 

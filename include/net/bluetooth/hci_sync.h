@@ -43,6 +43,11 @@ void hci_cmd_sync_clear(struct hci_dev *hdev);
 void hci_cmd_sync_cancel(struct hci_dev *hdev, int err);
 void __hci_cmd_sync_cancel(struct hci_dev *hdev, int err);
 
+static inline void hci_cmd_sync_cancel_sync(struct hci_dev *hdev, int err)
+{
+	__hci_cmd_sync_cancel(hdev, err);
+}
+
 int hci_cmd_sync_submit(struct hci_dev *hdev, hci_cmd_sync_work_func_t func,
 			void *data, hci_cmd_sync_work_destroy_t destroy);
 int hci_cmd_sync_queue(struct hci_dev *hdev, hci_cmd_sync_work_func_t func,
