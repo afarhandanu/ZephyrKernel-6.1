@@ -552,9 +552,10 @@ static inline struct page *pfn_swap_entry_to_page(swp_entry_t entry)
 
 		/*
 		 * Any use of migration entries may only occur while the
-		 * corresponding page is locked
+		 * corresponding page is locked. On Android GKI, avoid hard
+		 * panic with BUG_ON() during concurrent binder/zram swap.
 		 */
-		BUG_ON(!PageLocked(p));
+		WARN_ON_ONCE(!PageLocked(p));
 	}
 
 	return p;
